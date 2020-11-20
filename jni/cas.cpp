@@ -8,11 +8,19 @@
 #include <unistd.h>
 #include <string>
 #include <sys/stat.h> 
+#define __STDC_FORMAT_MACROS
+#include <inttypes.h>
 
 // #include <android/log.h>
 
 #include "fake_dlfcn.h"
-#include "AndHook.h"
+
+#if defined(__aarch64__)
+#include "And64InlineHook.hpp"
+#endif
+#if defined(__arm__)
+#include "Substrate/SubstrateHook.h"
+#endif
 
 #define LOG_TAG "LOGXX"
 #define LOG_BUF_SIZE 40960
@@ -25,6 +33,13 @@ t__android_log_vprint __android_log_vprint = nullptr;
 
 typedef void (*PFN_MSHookFunction)(void *symbol, void *replace, void **result);
 
+#if defined(__aarch64__)
+PFN_MSHookFunction pfn_MSHookFunction = A64HookFunction;
+#endif
+#if defined(__arm__)
+PFN_MSHookFunction pfn_MSHookFunction = MSHookFunction;
+#endif
+
 extern "C" int __android_log_print(int prio, const char *tag,  const char *fmt,...)
 {
     va_list ap;  
@@ -35,6 +50,34 @@ extern "C" int __android_log_print(int prio, const char *tag,  const char *fmt,.
     va_end(ap);
 
 	return __android_log_write(prio,tag,buf);
+}
+
+uint64_t get_module_base(const char *module_name) {
+    uint64_t addr = 0;
+    char line[1024];
+    uint64_t start = 0;
+    uint64_t end = 0;
+    char flags[5];
+    char path[PATH_MAX];
+
+    FILE *fp = fopen("/proc/self/maps", "r");
+    if (fp != nullptr) {
+        while (fgets(line, sizeof(line), fp)) {
+            strcpy(path, "");
+            sscanf(line, "%" PRIx64"-%" PRIx64" %s %*" PRIx64" %*x:%*x %*u %s\n", &start, &end,
+                   flags, path);
+#if defined(__aarch64__)
+            if (strstr(flags, "x") == 0)
+                continue;
+#endif
+            if (strstr(path, module_name)) {
+                addr = start;
+                break;
+            }
+        }
+        fclose(fp);
+    }
+    return addr;
 }
 
 #ifndef HEXDUMP_COLS
@@ -91,16 +134,16 @@ void hex_dump(void *mem, unsigned int len) {
 
 int count = 0;
 
-int (*old_lua_loadbuffer)(void *,char *,size_t,char *);
-int my_lua_loadbuffer(void *L,char *buff,size_t sz,char *name)
+int (*old_lua_loadbuffer)(void *,char *,size_t,char *, int a5 ,int a6);
+int my_lua_loadbuffer(void *L,char *buff,size_t sz,char *name, int a5 ,int a6)
 {
-    int ret = old_lua_loadbuffer(L,buff,sz,name);
-    // if(name[strlen(name)-1] == 0x63
-    //    &&name[strlen(name)-2] == 0x61
-    //    &&name[strlen(name)-3] == 0x75
-    //    &&name[strlen(name)-4] == 0x6c)
-    std::string s(name);
-    if (s.length() < 128)
+    // LOGD("AAAAAAAAAAAAAAAAAAAAAaa");
+    int ret = old_lua_loadbuffer(L,buff,sz,name, a5, a6);
+    if(name[strlen(name)-1] == 0x61
+       &&name[strlen(name)-2] == 0x75
+       &&name[strlen(name)-3] == 0x6c)
+    // std::string ssss(name);
+    if (strlen(name) < 128)
     {
         LOGD("luaname is :%s---",name);
         int name_len = strlen(name);
@@ -144,6 +187,11 @@ int my_lua_loadbuffer(void *L,char *buff,size_t sz,char *name)
     return ret;
 }
 
+int (*old_xxtea_decrypt)(int a1, int a2, int a3, unsigned int a4, void *a5);
+int new_xxtea_decrypt(int a1, int a2, int a3, unsigned int a4, void *a5) {
+    LOGD("xxtea_decrypt");
+    return old_xxtea_decrypt(a1, a2, a3, a4, a5);
+}
 
 void hook_entry() __attribute__((constructor));
 void hook_entry()
@@ -152,19 +200,26 @@ void hook_entry()
 	if (liblog_handle)
 	{
 		__android_log_write = (t__android_log_write)dlsym(liblog_handle,"__android_log_write");
-        // __android_log_vprint = (t__android_log_vprint)fake_dlsym(liblog_handle,"__android_log_vprint");
+        __android_log_vprint = (t__android_log_vprint)dlsym(liblog_handle,"__android_log_vprint");
 	}
 
     LOGD("hook_entry");
     // AKInitializeOnce();
-    void * libm_handle = dlopen("/data/app/com.game.dir-YcOiPziAOQeX1lmE3smC_Q==/lib/arm64/libmoba.so", RTLD_LAZY);
+    void * libm_handle = dlopen("/data/app/com.game.dir-i_RMvdy5OSL55GfGzCemdw==/lib/arm64/libcocos2dlua.so", RTLD_LAZY);
     if (!libm_handle)
     {
         LOGD("Open Error:%s",(char*)dlerror());
         return;
     }
     LOGD("libm_handle = %p", (char*)libm_handle);
-    void *p = dlsym(libm_handle, "luaL_loadbuffer");
+    void *p = dlsym(libm_handle, "luaL_loadbufferx");
     LOGD("luaL_loadbuffer = %p", (char*)p);
-    AKHookFunction(p, (void *)my_lua_loadbuffer, (void **)&old_lua_loadbuffer);
+    pfn_MSHookFunction(p, (void *)my_lua_loadbuffer, (void **)&old_lua_loadbuffer);
+    p = dlsym(libm_handle, "xxtea_decrypt");
+    LOGD("xxtea_decrypt = %p", (char*)p);
+    // uint64_t base = get_module_base("libcocos2dlua.so");
+    // LOGD("base ==> %lx", (unsigned long)base);
+    // // 5FF374
+    // p = (void*)(base + 0x5FF374);
+    // pfn_MSHookFunction(p, (void *)new_xxtea_decrypt, (void **)&old_xxtea_decrypt);
 }
